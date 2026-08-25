@@ -1,0 +1,679 @@
+// Placement marketplace — advertiser-facing catalog + internal fulfilment.
+// Publishers have no login. Sites and publisher contacts are admin-managed.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────  ADVERTISER SIDE  ─────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  passwordHash  String?
+  role          Role      @default(ADVERTISER)
+  country       String?   // ISO-2, for tax/invoicing
+  createdAt     DateTime  @default(now())
+
+  // Captured at checkout and snapshotted onto the invoice. Editing these later
+  // must never change an invoice that has already been issued.
+  legalName      String?
+  billingAddress String?
+  taxId          String?   // GST / VAT registration number
+  billingCountry String?   // ISO-2; decides which payment provider is used
+
+  // ── Access gating ──────────────────────────────────────────────────────────
+  status         UserStatus @default(PENDING)
+
+  // Captured at signup so there is something to review. Without these an
+  // approval decision is a coin toss on an email address.
+  companyName    String?
+  companyWebsite String?
+  jobRole        String?
+  promoting      String?   // what they intend to promote
+
+  // Who decided, and when. The full trail lives in AdminAuditLog; these are
+  // denormalised so the queue can show them without a join.
+  statusDecidedAt   DateTime?
+  statusDecidedById String?
+  statusDecidedBy   User?    @relation("StatusDecisions", fields: [statusDecidedById], references: [id])
+  decisionsMade     User[]   @relation("StatusDecisions")
+
+  projects      Project[]
+  orders        Order[]
+  wallet        Wallet?
+  tickets       Ticket[]
+  resetTokens   PasswordResetToken[]
+  cart          Cart?
+  statusEvents  ItemStatusEvent[]
+  assignedItems OrderItem[]        @relation("AssignedEditor")
+  auditLogs     AdminAuditLog[]
+  priceEdits    SitePriceHistory[]
+  invoices      Invoice[]
+  ledgerEntries Transaction[]
+  publisherNotes PublisherNote[]
+  correspondence ItemCorrespondence[]
+  imports       ImportLog[]
+}
+
+// Password reset. Only the hash of the token is stored, so a database leak
+// cannot be replayed to take over an account. Single-use via `usedAt`.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+enum Role {
+  ADVERTISER
+  ADMIN
+  EDITOR      // internal fulfilment staff
+}
+
+// Nothing about the catalog is visible until an account exists *and* staff have
+// approved it. PENDING and REJECTED are deliberately indistinguishable to the
+// account holder — telling a rejected applicant why just teaches a competitor
+// how to pass on the second attempt.
+enum UserStatus {
+  PENDING     // signed up, awaiting review — the default
+  APPROVED    // full catalog and ordering access
+  REJECTED    // terminal
+  SUSPENDED   // was approved, access revoked
+}
+
+// An advertiser usually runs several client sites. Anchors, budgets and
+// reporting all hang off the project, not the user.
+model Project {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  targetUrl   String   // primary domain being promoted
+  notes       String?
+  createdAt   DateTime @default(now())
+
+  user        User     @relation(fields: [userId], references: [id])
+  orders      Order[]
+  cartLines   CartLine[]
+
+  @@index([userId])
+}
+
+model Wallet {
+  id            String        @id @default(cuid())
+  userId        String        @unique
+  balanceCents  Int           @default(0)
+  currency      String        @default("USD")
+
+  user          User          @relation(fields: [userId], references: [id])
+  transactions  Transaction[]
+}
+
+// Append-only ledger. No updates, no deletes — a mistake is corrected with a
+// compensating ADJUSTMENT row carrying a reason and an actor.
+model Transaction {
+  id           String          @id @default(cuid())
+  walletId     String
+  type         TransactionType
+  amountCents  Int             // signed minor units: negative for money out
+  currency     String          @default("USD") // a bare integer is a bug waiting
+  orderId      String?
+  // Capture and refund happen per item, so the ledger records which one.
+  orderItemId  String?
+  providerRef  String?         // provider intent / charge / refund id
+  providerEventId String?      // the webhook event that produced this row
+  actorUserId  String?         // null for provider-driven rows
+  reason       String?         // required in practice for ADJUSTMENT
+  createdAt    DateTime        @default(now())
+
+  wallet       Wallet          @relation(fields: [walletId], references: [id])
+  actor        User?           @relation(fields: [actorUserId], references: [id])
+
+  @@index([walletId, createdAt])
+  @@index([orderId, createdAt])
+  @@index([orderItemId])
+}
+
+// Providers retry aggressively and send duplicates. A repeated event id is a
+// no-op: the unique constraint is what makes webhook handling idempotent.
+model ProcessedWebhookEvent {
+  id              String   @id @default(cuid())
+  provider        String   // "STRIPE" | "RAZORPAY"
+  providerEventId String
+  eventType       String
+  orderId         String?
+  receivedAt      DateTime @default(now())
+  processedAt     DateTime?
+  // Kept for replay and dispute investigation, never re-parsed for amounts.
+  payloadDigest   String?
+
+  @@unique([provider, providerEventId])
+  @@index([orderId])
+}
+
+// Issued on capture. Immutable: corrections are credit notes, never edits.
+model Invoice {
+  id        String   @id @default(cuid())
+  number    String   @unique // sequential, gapless: INV-YYYY-NNNNN
+  orderId   String
+  userId    String
+
+  // Buyer details snapshotted at issue. Updating the user later must not
+  // change an invoice that has already been sent.
+  buyerLegalName String
+  buyerAddress   String?
+  buyerTaxId     String?
+  buyerCountry   String?
+
+  subtotalMinor Int
+  taxMinor      Int      @default(0)
+  totalMinor    Int
+  currency      String
+
+  pdfPath   String?  // stored bytes; never re-rendered from live data
+  issuedAt  DateTime @default(now())
+
+  order     Order    @relation(fields: [orderId], references: [id])
+  user      User     @relation(fields: [userId], references: [id])
+  creditNotes CreditNote[]
+
+  @@index([userId, issuedAt])
+  @@index([orderId])
+}
+
+model CreditNote {
+  id        String   @id @default(cuid())
+  number    String   @unique // CN-YYYY-NNNNN
+  invoiceId String
+  amountMinor Int
+  currency  String
+  reason    String
+  pdfPath   String?
+  issuedAt  DateTime @default(now())
+
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id])
+
+  @@index([invoiceId])
+}
+
+// Gapless sequences for invoices and credit notes, taken under an atomic
+// increment so concurrent orders cannot claim the same number or skip one.
+model DocumentCounter {
+  key        String @id // e.g. "invoice:2026"
+  lastNumber Int    @default(0)
+}
+
+enum TransactionType {
+  TOP_UP
+  ORDER_HOLD
+  ORDER_CAPTURE
+  REFUND
+  ADJUSTMENT
+}
+
+// ─────────────────────────────  CATALOG  ─────────────────────────────
+
+model Site {
+  id             String   @id @default(cuid())
+  domain         String   @unique
+  channelType    ChannelType @default(WEBSITE)
+  country        String   // ISO-2
+  language       String   // ISO-639-1
+  description    String?
+
+  // Pricing: cost is what you pay the publisher, price is what the advertiser sees.
+  // Never expose costCents through the public API.
+  costCents      Int
+  priceCents     Int
+  writingCents   Int      @default(0)   // upcharge if you supply the article
+  turnaroundDays Int      @default(7)
+
+  // Placement rules
+  linkType       LinkType @default(DOFOLLOW)
+  maxLinks       Int      @default(2)
+  minWords       Int      @default(700)
+  permanent      Boolean  @default(true)
+  guaranteeDays  Int      @default(90)
+  acceptsSensitive String[] // ["casino","crypto","adult","cbd","forex","dating"]
+
+  isActive       Boolean  @default(true)
+  isExclusive    Boolean  @default(false)
+
+  // Drives the metrics refresh cadence: recently ordered or viewed sites are
+  // refreshed weekly, other active sites monthly, inactive ones on demand.
+  lastViewedAt   DateTime?
+
+  categories     CategoryOnSite[]
+  metrics        SiteMetric?
+  publisher      Publisher? @relation(fields: [publisherId], references: [id])
+  publisherId    String?
+  orderItems     OrderItem[]
+  cartLines      CartLine[]
+  priceHistory   SitePriceHistory[]
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([country, isActive])
+  @@index([priceCents])
+}
+
+enum ChannelType {
+  WEBSITE
+  TELEGRAM
+  YOUTUBE
+  NEWSWIRE
+}
+
+enum LinkType {
+  DOFOLLOW
+  NOFOLLOW
+  SPONSORED
+  MIXED
+}
+
+model Category {
+  id    String @id @default(cuid())
+  slug  String @unique
+  name  String
+  sites CategoryOnSite[]
+}
+
+model CategoryOnSite {
+  siteId     String
+  categoryId String
+  site       Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  category   Category @relation(fields: [categoryId], references: [id])
+
+  @@id([siteId, categoryId])
+}
+
+// Refreshed on a schedule from DataForSEO / Ahrefs. Kept separate from Site so
+// a failed metrics refresh never blocks catalog edits.
+model SiteMetric {
+  siteId          String   @id
+  domainRating    Int?
+  urlRating       Int?
+  organicTraffic  Int?
+  refDomains      Int?
+  spamScore       Int?
+  topCountry      String?
+  topCountryShare Float?
+  gaVerified      Boolean  @default(false)  // publisher granted GA read access
+  gscVerified     Boolean  @default(false)
+  fetchedAt       DateTime @default(now())
+
+  site            Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
+}
+
+// Not a login — just a contact record your team works from.
+model Publisher {
+  id          String   @id @default(cuid())
+  name        String
+  email       String?
+  telegram    String?
+  payoutNotes String?
+  reliability Int      @default(0) // 0–100, computed from delivery history
+  // Kept alongside the score so the number can be explained, not just shown.
+  reliabilityComputedAt DateTime?
+  onTimeRate            Int?      // percent
+  rejectionRate         Int?      // percent
+  avgDaysOverQuoted     Int?
+  deadLinkCount         Int?
+
+  sites       Site[]
+  notes       PublisherNote[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
+}
+
+// Free-text correspondence log against a publisher.
+model PublisherNote {
+  id          String    @id @default(cuid())
+  publisherId String
+  body        String
+  actorUserId String?
+  createdAt   DateTime  @default(now())
+
+  publisher   Publisher @relation(fields: [publisherId], references: [id], onDelete: Cascade)
+  actor       User?     @relation(fields: [actorUserId], references: [id])
+
+  @@index([publisherId, createdAt])
+}
+
+// What was sent to the publisher about one placement, and when.
+model ItemCorrespondence {
+  id          String    @id @default(cuid())
+  orderItemId String
+  body        String
+  actorUserId String?
+  createdAt   DateTime  @default(now())
+
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  actor       User?     @relation(fields: [actorUserId], references: [id])
+
+  @@index([orderItemId, createdAt])
+}
+
+// Orders snapshot their own prices, so this is not for billing. It answers
+// "why did our margin drop last quarter" and shows a publisher who quietly
+// raised rates three times in a year.
+model SitePriceHistory {
+  id            String   @id @default(cuid())
+  siteId        String
+  oldCostCents  Int
+  newCostCents  Int
+  oldPriceCents Int
+  newPriceCents Int
+  actorUserId   String?
+  // Set only when an admin deliberately saved price <= cost.
+  overrideReason String?
+  createdAt     DateTime @default(now())
+
+  site          Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  actor         User?    @relation(fields: [actorUserId], references: [id])
+
+  @@index([siteId, createdAt])
+}
+
+// Every write performed in admin. The first time a number looks wrong and
+// nobody remembers changing it, this is the answer.
+model AdminAuditLog {
+  id          String   @id @default(cuid())
+  actorUserId String?
+  action      String   // e.g. "site.update", "publisher.create", "catalog.import"
+  entityType  String   // "Site" | "Publisher" | "OrderItem" | "Import"
+  entityId    String?
+  before      Json?
+  after       Json?
+  createdAt   DateTime @default(now())
+
+  actor       User?    @relation(fields: [actorUserId], references: [id])
+
+  @@index([entityType, entityId, createdAt])
+  @@index([actorUserId, createdAt])
+}
+
+// One row per CSV import that was actually committed.
+model ImportLog {
+  id           String   @id @default(cuid())
+  actorUserId  String?
+  fileName     String
+  createdCount Int      @default(0)
+  updatedCount Int      @default(0)
+  unchangedCount Int    @default(0)
+  errorCount   Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  actor        User?    @relation(fields: [actorUserId], references: [id])
+
+  @@index([createdAt])
+}
+
+// ─────────────────────────────  CART  ─────────────────────────────
+
+// Server-side, not browser storage: an agency builds a batch over days and
+// switches devices, and the cart has to follow them.
+model Cart {
+  id        String     @id @default(cuid())
+  userId    String     @unique
+  updatedAt DateTime   @updatedAt
+  createdAt DateTime   @default(now())
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lines     CartLine[]
+}
+
+// Duplicate (site, project) pairs are allowed on purpose — two placements on
+// one site for one project is occasionally deliberate, so the UI warns rather
+// than the schema forbidding it.
+model CartLine {
+  id        String   @id @default(cuid())
+  cartId    String
+  siteId    String
+  projectId String
+  createdAt DateTime @default(now())
+
+  cart      Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  site      Site     @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([cartId])
+  @@index([siteId])
+  @@index([projectId])
+}
+
+// ─────────────────────────────  ORDERS  ─────────────────────────────
+
+model Order {
+  id            String      @id @default(cuid())
+  reference     String      @unique // human-readable, e.g. ORD-2026-00412
+  userId        String
+  projectId     String?
+  status        OrderStatus @default(DRAFT)
+  subtotalCents Int
+  totalCents    Int
+  currency      String      @default("USD")
+  placedAt      DateTime?
+  createdAt     DateTime    @default(now())
+
+  // Supplied by the client when placing. Unique, so a double-click or a
+  // resubmit after a flaky connection collides instead of creating a second
+  // order. Scoped per user by including the user id in the stored value.
+  idempotencyKey String?    @unique
+
+  // Resolved once at placement and never re-resolved: a customer who moves
+  // country must not break an in-flight refund.
+  billingCountry  String?
+  paymentProvider String?   // "STRIPE" | "RAZORPAY"
+  providerIntentId String?  @unique
+
+  // If we display one currency and charge another, both amounts and the rate
+  // are snapshotted here. A historical total is never recomputed from today's rate.
+  displayCurrency    String?
+  displayTotalMinor  Int?
+  fxRateMicros       Int?    // charge currency per display unit, ×1e6
+
+  user          User        @relation(fields: [userId], references: [id])
+  project       Project?    @relation(fields: [projectId], references: [id])
+  items         OrderItem[]
+  invoices      Invoice[]
+
+  @@index([userId, status])
+  @@index([userId, createdAt])
+}
+
+// Sequential order references within a calendar year (ORD-YYYY-NNNNN). A
+// counter row is taken under an atomic increment inside the placement
+// transaction, so two concurrent placements cannot claim the same number.
+model OrderCounter {
+  year       Int @id
+  lastNumber Int @default(0)
+}
+
+enum OrderStatus {
+  DRAFT
+  PENDING_PAYMENT
+  IN_PROGRESS
+  PARTIALLY_COMPLETE
+  COMPLETE
+  CANCELLED
+}
+
+model OrderItem {
+  id             String         @id @default(cuid())
+  orderId        String
+  siteId         String
+  status         ItemStatus     @default(QUEUED)
+
+  targetUrl      String
+  anchorText     String
+  contentSource  ContentSource  @default(ADVERTISER)
+  articleUrl     String?        // uploaded doc, or draft produced by your writer
+  briefNotes     String?
+
+  priceCents     Int            // snapshot at purchase time
+  costCents      Int            // snapshot; internal only
+
+  publishedUrl   String?
+  publishedAt    DateTime?
+  assignedToId   String?        // internal EDITOR handling this placement
+
+  order          Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  site           Site           @relation(fields: [siteId], references: [id])
+  linkChecks     LinkCheck[]
+  linkAlerts     LinkAlert[]
+  statusEvents   ItemStatusEvent[]
+  correspondence ItemCorrespondence[]
+  assignedTo     User?          @relation("AssignedEditor", fields: [assignedToId], references: [id])
+
+  @@index([status])
+  @@index([orderId])
+  @@index([assignedToId, status])
+}
+
+// Audit trail. Every status change writes exactly one row, from inside the same
+// transaction as the change — support and refund disputes run on this later, and
+// history cannot be reconstructed after the fact.
+model ItemStatusEvent {
+  id          String     @id @default(cuid())
+  orderItemId String
+  fromStatus  ItemStatus?
+  toStatus    ItemStatus
+  actorUserId String?    // null only for system-driven transitions
+  note        String?
+  createdAt   DateTime   @default(now())
+
+  orderItem   OrderItem  @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  actor       User?      @relation(fields: [actorUserId], references: [id])
+
+  @@index([orderItemId, createdAt])
+}
+
+enum ItemStatus {
+  QUEUED
+  CONTENT_PENDING
+  SUBMITTED_TO_PUBLISHER
+  REVISION_REQUESTED
+  PUBLISHED
+  VERIFIED
+  REFUNDED
+  REJECTED
+}
+
+enum ContentSource {
+  ADVERTISER   // they upload the article
+  PLATFORM     // you write it, writingCents applies
+}
+
+// Cron re-crawls every published URL. This is the guarantee that makes the
+// product trustworthy — and the evidence you need for refunds.
+model LinkCheck {
+  id           String   @id @default(cuid())
+  orderItemId  String
+  checkedAt    DateTime @default(now())
+  httpStatus   Int?
+  linkPresent  Boolean
+  linkTypeSeen String?  // dofollow / nofollow as actually rendered
+  indexed      Boolean?
+
+  // The distinctions that matter. A fetch failure is not a dead link, so the
+  // outcome is never collapsed into a single boolean.
+  outcome        LinkCheckOutcome @default(OK)
+  finalUrl       String?          // after following redirects
+  redirectCount  Int              @default(0)
+  anchorTextSeen String?
+  /** True for blocked or errored fetches: a human looks, nothing auto-refunds. */
+  manualReview   Boolean          @default(false)
+  attempt        Int              @default(1)
+  note           String?
+
+  orderItem    OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@index([orderItemId, checkedAt])
+  @@index([outcome, checkedAt])
+}
+
+enum LinkCheckOutcome {
+  OK               // 200, link present, rel as sold
+  LINK_ABSENT      // 200, article intact, link gone
+  REL_CHANGED      // 200, link present, quietly made nofollow
+  ANCHOR_CHANGED   // 200, link present, anchor text altered
+  ARTICLE_DELETED  // 404 / 410
+  ARTICLE_MOVED    // redirected to a different path
+  URL_CHANGED      // 200 but the final URL is not the one we bought
+  DEINDEXED        // live, but absent from the search index
+  BLOCKED          // 403 / 429 / bot challenge — publisher blocking us
+  FETCH_ERROR      // network failure, timeout
+}
+
+// Raised when a link goes from present to absent. Staff see these; the
+// advertiser is deliberately not told automatically on a first failure.
+model LinkAlert {
+  id          String    @id @default(cuid())
+  orderItemId String
+  outcome     LinkCheckOutcome
+  openedAt    DateTime  @default(now())
+  resolvedAt  DateTime?
+  resolution  String?
+  /** Set once three failed checks span at least three days. */
+  refundEligibleAt DateTime?
+  acknowledgedBy   String?
+
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@index([orderItemId, openedAt])
+  @@index([resolvedAt])
+}
+
+// Metrics lookups cost money per domain. One row per day, so the cap is
+// enforced against a number that cannot drift.
+model MetricsSpend {
+  day          String   @id // YYYY-MM-DD
+  lookups      Int      @default(0)
+  spentMinor   Int      @default(0)
+  capMinor     Int
+  capHitAt     DateTime?
+  alertedAt    DateTime?
+  updatedAt    DateTime @updatedAt
+}
+
+// Why a refresh did or did not happen, and what it cost.
+model MetricsRefreshLog {
+  id         String   @id @default(cuid())
+  siteId     String
+  succeeded  Boolean
+  costMinor  Int      @default(0)
+  error      String?
+  createdAt  DateTime @default(now())
+
+  @@index([siteId, createdAt])
+}
+
+model Ticket {
+  id        String       @id @default(cuid())
+  userId    String
+  subject   String
+  status    TicketStatus @default(OPEN)
+  createdAt DateTime     @default(now())
+
+  user      User         @relation(fields: [userId], references: [id])
+}
+
+enum TicketStatus {
+  OPEN
+  WAITING_ON_CUSTOMER
+  RESOLVED
+}

@@ -1,0 +1,6 @@
+{
+  "crons": [
+    { "path": "/api/cron/link-checks", "schedule": "0 3 * * *" },
+    { "path": "/api/cron/metrics-refresh", "schedule": "0 4 * * *" }
+  ]
+}
