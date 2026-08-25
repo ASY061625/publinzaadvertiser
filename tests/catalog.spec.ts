@@ -13,6 +13,7 @@
 
 import { describe, it, expect, beforeAll } from "vitest";
 import { approvedSessionCookie } from "./helpers/client";
+import { MAX_LIMIT } from "@/lib/catalog/filters";
 
 /*
  * The catalog is no longer public: it needs a signed-in, approved account.
@@ -231,9 +232,11 @@ describe("keyset pagination", () => {
     let total = 0;
 
     // Page size is derived from the catalog's actual size so this exercises a
-    // multi-page walk whether the database holds 67 curated rows or 5,000.
+    // multi-page walk whether the database holds 67 curated rows or 5,000, and
+    // clamped to the largest page the route serves. A quarter of the bulk
+    // catalog is over MAX_LIMIT, which the route rejects outright.
     const catalogSize = (await fetchSites({ [Q.limit]: 1 })).body.total as number;
-    const limit = Math.max(1, Math.floor(catalogSize / 4));
+    const limit = Math.min(MAX_LIMIT, Math.max(1, Math.floor(catalogSize / 4)));
 
     do {
       const params: any = { [Q.sort]: SORT_DR, [Q.limit]: limit };

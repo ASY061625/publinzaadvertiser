@@ -219,9 +219,20 @@ describe("2. stale metrics are flagged", () => {
     expect(isStale(new Date(Date.now() - (STALENESS_DAYS + 1) * DAY))).toBe(true);
     expect(isStale(null)).toBe(true);
 
-    const catalog = await queryCatalog(CATALOG_READER, parseFilters(new URLSearchParams("limit=100")));
+    // Scoped to this run's domain prefix rather than reading the first page of
+    // the whole catalog: under the 5,000-row bulk seed these two rows sort
+    // nowhere near the top, and an unfiltered page would simply not contain them.
+    const catalog = await queryCatalog(
+      CATALOG_READER,
+      parseFilters(new URLSearchParams(`q=p6-site-${SUFFIX}-&limit=100`))
+    );
     const freshRow = catalog.sites.find((s) => s.id === fresh.id);
     const oldRow = catalog.sites.find((s) => s.id === old.id);
+
+    // Guards the lookup above: if the prefix ever stops matching, the two
+    // assertions that follow must fail loudly rather than on `undefined`.
+    expect(freshRow, `fresh site ${fresh.domain} missing from catalog`).toBeDefined();
+    expect(oldRow, `old site ${old.domain} missing from catalog`).toBeDefined();
 
     // The catalog payload carries the flag, so the UI can show it without
     // recomputing a threshold of its own.

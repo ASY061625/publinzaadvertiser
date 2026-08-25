@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { GET as getSites } from "@/app/api/sites/route";
 import { GET as getFacets } from "@/app/api/sites/facets/route";
 import { prisma } from "@/lib/db";
+import { MAX_LIMIT } from "@/lib/catalog/filters";
 
 /*
  * These call the route handlers in-process, so there is no session to gate on.
@@ -75,9 +76,12 @@ describe("GET /api/sites does not leak internal pricing", () => {
 
   it("omits costCents on every page of a keyset walk", async () => {
     // Page size derived from the catalog size so the walk really spans pages
-    // under both the curated seed and the 5,000-row bulk seed.
+    // under both the curated seed and the 5,000-row bulk seed. Clamped to
+    // MAX_LIMIT: a quarter of the bulk catalog is far above the largest page
+    // the route will serve, and an over-limit request is a 400 whose body has
+    // no cursor — the walk would stop on page one and check nothing.
     const catalogSize = (await fetchCatalog("limit=1")).body.total as number;
-    const limit = Math.max(1, Math.floor(catalogSize / 4));
+    const limit = Math.min(MAX_LIMIT, Math.max(1, Math.floor(catalogSize / 4)));
 
     let cursor: string | null = null;
     let pages = 0;

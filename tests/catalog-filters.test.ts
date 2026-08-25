@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { GET as getSites } from "@/app/api/sites/route";
+import { MAX_LIMIT } from "@/lib/catalog/filters";
 
 /*
  * These call the route handlers in-process, so there is no session to gate on.
@@ -144,9 +145,11 @@ describe("sorting", () => {
 describe("keyset pagination", () => {
   it("walks the whole filtered set with no gaps or repeats", async () => {
     // Page size follows the filtered row count, so the walk spans several pages
-    // regardless of how many rows the current seed produced.
+    // regardless of how many rows the current seed produced — but it is still a
+    // page size the route will accept. Above MAX_LIMIT the request is rejected,
+    // and the walk would end on page one having proved nothing.
     const sizing = await catalog("sort=dr&drMin=40&limit=1");
-    const limit = Math.max(1, Math.floor(sizing.body.total / 4));
+    const limit = Math.min(MAX_LIMIT, Math.max(1, Math.floor(sizing.body.total / 4)));
 
     const filter = `sort=dr&drMin=40&limit=${limit}`;
     const first = await catalog(filter);
